@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemini Voice Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --primary: #38bdf8;
+            --secondary: #94a3b8;
+            --text: #f8fafc;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text);
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        .container {
+            background-color: var(--card-bg);
+            padding: 2.5rem;
+            border-radius: 1.5rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            text-align: center;
+            width: 90%;
+            max-width: 400px;
+            transition: transform 0.3s ease;
+        }
+
+        h1 { margin-bottom: 0.5rem; font-size: 1.5rem; }
+        p { color: var(--secondary); margin-bottom: 2rem; font-size: 0.9rem; }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 8px;
+            background-color: #ef4444; /* red */
+        }
+        .status-dot.active { background-color: #22c55e; /* green */ }
+
+        #mic-btn {
+            background-color: var(--primary);
+            color: white;
+            border: none;
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto;
+            font-size: 2rem;
+            box-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        #mic-btn:active { transform: scale(0.9); }
+        #mic-btn.listening {
+            animation: pulse 1.5s infinite;
+            background-color: #f43f5e;
+            box-shadow: 0 0 30px rgba(244, 63, 94, 0.6);
+        }
+
+        @keyframes pulse {
+            0% { transform: scale(1); box-shadow: 0 0 20px rgba(244, 63, 94, 0.4); }
+            50% { transform: scale(1.1); box-shadow: 0 0 40px rgba(244, 63, 94, 0.6); }
+            100% { transform: scale(1); box-shadow: 0 0 20px rgba(244, 63, 94, 0.4); }
+        }
+
+        #transcript {
+            margin-top: 2rem;
+            font-style: italic;
+            height: 3rem;
+            opacity: 0.7;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Gemini Voice AI</h1>
+        <p><span id="dot" class="status-dot"></span> <span id="status-text">Disconnected</span></p>
+        
+        <button id="mic-btn">🎙️</button>
+        
+        <div id="transcript">Click to start conversation</div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

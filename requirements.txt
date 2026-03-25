@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+websockets
+python-dotenv
+google-genai
+audioop-lts
