@@ -6,6 +6,7 @@ import asyncio
 import audioop
 import traceback
 import datetime
+import urllib.request
 from fastapi import FastAPI, WebSocket, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -16,10 +17,10 @@ from google import genai
 from google.genai import types
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.voice_response import VoiceResponse, Connect
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
-# Simple log function that works on Windows without encoding issues
 _log_file = open("debug.log", "a", encoding="ascii", errors="replace")
 def log_info(msg):
     ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -42,13 +43,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -- Config --
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 YOUR_PHONE_NUMBER = os.getenv("YOUR_PHONE_NUMBER")
-NGROK_URL = os.getenv("NGROK_URL")
+
+# Thread pool for CPU-bound audio ops (keeps async loop unblocked)
+_audio_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio")
+
+def _resample_sync(pcm_8k: bytes, ratecv_state):
+    """Run in thread pool — keeps event loop free."""
+    pcm_16k, new_state = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, ratecv_state)
+    return pcm_16k, new_state
+
+def _decode_mulaw_sync(mulaw_bytes: bytes) -> bytes:
+    return audioop.ulaw2lin(mulaw_bytes, 2)
+
+def _encode_mulaw_sync(pcm_8k: bytes) -> bytes:
+    return audioop.lin2ulaw(pcm_8k, 2)
+
+def _downsample_sync(pcm_24k: bytes):
+    pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
+    return pcm_8k
+
+def get_ngrok_url():
+    try:
+        resp = urllib.request.urlopen("http://localhost:4040/api/tunnels", timeout=3)
+        data = json.loads(resp.read().decode())
+        for tunnel in data.get("tunnels", []):
+            url = tunnel.get("public_url", "")
+            if url.startswith("https://"):
+                return url
+        if data.get("tunnels"):
+            return data["tunnels"][0]["public_url"]
+    except Exception as e:
+        log_info(f"[NGROK] Could not auto-detect ngrok URL: {e}")
+    env_url = os.getenv("NGROK_URL", "")
+    if env_url:
+        log_info(f"[NGROK] Falling back to .env URL: {env_url}")
+    return env_url
+
+NGROK_URL = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -77,21 +113,26 @@ class TranscriptController:
 transcript_manager = TranscriptController()
 
 @app.get("/events")
-async def events():
-    """SSE endpoint for dashboard transcript."""
+async def events(request: Request):
     async def event_generator():
         q = transcript_manager.subscribe()
         try:
             while True:
-                msg = await q.get()
-                yield {"data": json.dumps(msg)}
-        except asyncio.CancelledError:
+                if await request.is_disconnected():
+                    break
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=15.0)
+                    yield {"data": json.dumps(msg)}
+                except asyncio.TimeoutError:
+                    yield {"comment": "keepalive"}
+        except (asyncio.CancelledError, Exception):
+            pass
+        finally:
             transcript_manager.unsubscribe(q)
 
     return EventSourceResponse(event_generator())
 
 
-# -- Static / Dashboard --
 @app.get("/", response_class=HTMLResponse)
 async def get_index():
     index_path = os.path.join(STATIC_DIR, "index.html")
@@ -100,12 +141,18 @@ async def get_index():
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# -- Initiate outbound call --
 @app.post("/make-call")
 async def make_call():
-    """Trigger an outbound call from Twilio to your personal number."""
+    global NGROK_URL
+    NGROK_URL = get_ngrok_url()
+    if not NGROK_URL:
+        return JSONResponse(
+            {"status": "error", "message": "ngrok is not running. Start ngrok first!"},
+            status_code=503,
+        )
+    log_info(f"[CALL] Using ngrok URL: {NGROK_URL}")
+
     twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    
     call = twilio_client.calls.create(
         to=YOUR_PHONE_NUMBER,
         from_=TWILIO_PHONE_NUMBER,
@@ -117,37 +164,27 @@ async def make_call():
     return JSONResponse({"status": "calling", "call_sid": call.sid})
 
 
-# -- TwiML: tell Twilio to stream audio to our WebSocket --
 @app.api_route("/twiml", methods=["GET", "POST"])
 async def twiml_handler(request: Request):
-    """Return TwiML that connects the call to a media stream."""
     response = VoiceResponse()
-
-    # Immediately connect to the media stream (no pause/say - reduces latency)
     connect = Connect()
     ws_url = f"wss://{NGROK_URL.replace('https://', '').replace('http://', '')}/media-stream"
     log_info(f"[TWIML] Stream URL = {ws_url}")
     connect.stream(url=ws_url)
     response.append(connect)
-
-    # Fallback if the media stream disconnects
     response.say("The AI agent has disconnected. Goodbye.")
-
     return HTMLResponse(content=str(response), media_type="application/xml")
 
 
-# -- Call status callback --
 @app.api_route("/call-status", methods=["GET", "POST"])
 async def call_status(request: Request):
     body = await request.body()
     decoded = body.decode("utf-8")
     status = "unknown"
-    
     for param in decoded.split("&"):
         if param.startswith("CallStatus="):
             status = param.split("=")[1]
             break
-
     log_info(f"[STATUS] Call status: {status}")
     if status == "completed":
         await transcript_manager.add_message("system", "Call ended")
@@ -163,6 +200,7 @@ async def media_stream(websocket: WebSocket):
 
     stream_sid = None
     session_active = True
+    loop = asyncio.get_event_loop()
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     model = "gemini-2.5-flash-native-audio-preview-12-2025"
@@ -171,16 +209,23 @@ async def media_stream(websocket: WebSocket):
         response_modalities=["AUDIO"],
         output_audio_transcription=types.AudioTranscriptionConfig(),
         input_audio_transcription=types.AudioTranscriptionConfig(),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                prefix_padding_ms=50,
+                silence_duration_ms=200,
+            )
+        ),
         system_instruction=types.Content(
             parts=[
                 types.Part.from_text(
                     text=(
-                        "You are a friendly and professional AI phone agent. "
-                        "You are speaking to a person on a phone call. "
-                        "Be conversational, polite, and helpful. Keep responses concise and short. "
-                        "You are fully bilingual/multilingual and can fluently speak and understand English, Hindi, and Marathi. "
-                        "If the user speaks Hindi, reply in Hindi. If the user speaks Marathi, reply in Marathi. "
-                        "Start by greeting the user warmly and ask how you can assist them today."
+                        "You are a friendly and professional AI phone agent on a live phone call. "
+                        "CRITICAL: Keep ALL responses extremely brief - maximum 1-2 short sentences. "
+                        "Be conversational and natural like a human phone agent. Never give long explanations. "
+                        "You are multilingual - respond in whatever language the caller uses (English, Hindi, or Marathi). "
+                        "Start with a brief warm greeting."
                     )
                 )
             ]
@@ -192,7 +237,6 @@ async def media_stream(websocket: WebSocket):
         async with client.aio.live.connect(model=model, config=config) as session:
             log_info("[GEMINI] Session ESTABLISHED")
 
-            # Trigger Gemini to greet (uses realtime input for lowest latency)
             try:
                 await session.send_realtime_input(
                     text="The call just connected. Please greet the caller."
@@ -201,41 +245,18 @@ async def media_stream(websocket: WebSocket):
             except Exception as e:
                 log_info(f"[GEMINI] Greeting failed: {e}")
 
-            # Audio queue for batched sending to Gemini
-            audio_queue = asyncio.Queue()
-
-            # -- Task: Drain audio queue and send batched to Gemini --
-            async def audio_sender():
-                """Batches audio chunks and sends to Gemini every ~100ms."""
-                while session_active:
-                    # Wait for at least one chunk
-                    try:
-                        first_chunk = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        continue
-
-                    # Collect all available chunks (drain queue)
-                    chunks = [first_chunk]
-                    while not audio_queue.empty():
-                        try:
-                            chunks.append(audio_queue.get_nowait())
-                        except asyncio.QueueEmpty:
-                            break
-
-                    # Concatenate all PCM chunks into one blob
-                    combined = b"".join(chunks)
-                    try:
-                        await session.send_realtime_input(
-                            audio=types.Blob(data=combined, mime_type="audio/pcm;rate=16000")
-                        )
-                    except Exception as e:
-                        log_info(f"[AUDIO_SENDER] Error: {e}")
-                        break
-
-            # -- Task: Twilio -> Gemini (user audio) --
+            # ----------------------------------------------------------------
+            # Twilio -> Gemini: stream audio with minimal buffering
+            # ----------------------------------------------------------------
             async def twilio_to_gemini():
                 nonlocal stream_sid, session_active
                 chunks = 0
+                sends = 0
+                ratecv_state = None
+
+                # *** KEY CHANGE: send every packet immediately (no batching) ***
+                # One Twilio packet = 20ms of audio — Gemini handles it fine.
+                # Batching was adding up to 100ms of unnecessary delay per chunk.
                 try:
                     async for message in websocket.iter_text():
                         if not session_active:
@@ -249,14 +270,29 @@ async def media_stream(websocket: WebSocket):
                             log_info(f"[STREAM] Started: {stream_sid}")
 
                         elif event == "media":
-                            # Decode mulaw -> PCM 8kHz -> PCM 16kHz
                             mulaw_bytes = base64.b64decode(data["media"]["payload"])
-                            pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
-                            pcm_16k, _ = audioop.ratecv(pcm_8k, 2, 1, 8000, 16000, None)
 
-                            # Put in queue (non-blocking) for batched sending
-                            audio_queue.put_nowait(pcm_16k)
+                            # Offload CPU work to thread pool
+                            pcm_8k = await loop.run_in_executor(
+                                _audio_executor, _decode_mulaw_sync, mulaw_bytes
+                            )
+
+                            # RMS-based silence gate (Noise Gate)
+                            rms = audioop.rms(pcm_8k, 2)
+                            # log_info(f"[RMS] {rms}")  # Temporarily uncomment to tune the 200 threshold
+                            if rms < 200:
+                                pcm_8k = bytes(len(pcm_8k))
+
+                            pcm_16k, ratecv_state = await loop.run_in_executor(
+                                _audio_executor, _resample_sync, pcm_8k, ratecv_state
+                            )
+
+                            # Send immediately — no batching delay
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=pcm_16k, mime_type="audio/pcm;rate=16000")
+                            )
                             chunks += 1
+                            sends += 1
 
                         elif event == "stop":
                             log_info("[STREAM] Twilio stop event")
@@ -266,12 +302,16 @@ async def media_stream(websocket: WebSocket):
                     log_info(f"[TWILIO->GEMINI] Error: {e}")
                 finally:
                     session_active = False
-                    log_info(f"[TWILIO->GEMINI] Done. {chunks} chunks queued.")
+                    log_info(f"[TWILIO->GEMINI] Done. {chunks} chunks, {sends} sends.")
 
-            # -- Task: Gemini -> Twilio (AI audio) --
+            # ----------------------------------------------------------------
+            # Gemini -> Twilio: forward audio as fast as it arrives
+            # ----------------------------------------------------------------
             async def gemini_to_twilio():
                 nonlocal session_active
                 audio_out = 0
+                first_audio_time = None
+                user_speech_end_time = None
                 try:
                     while session_active:
                         async for response in session.receive():
@@ -282,13 +322,31 @@ async def media_stream(websocket: WebSocket):
                             if not sc:
                                 continue
 
-                            # Forward audio to Twilio
+                            if sc.input_transcription and sc.input_transcription.text:
+                                text = sc.input_transcription.text.strip()
+                                if text:
+                                    log_info(f"[USER] {text}")
+                                    await transcript_manager.add_message("user", text)
+                                    user_speech_end_time = loop.time()
+
                             if sc.model_turn:
                                 for part in sc.model_turn.parts:
                                     if part.inline_data and part.inline_data.data and stream_sid:
+                                        if first_audio_time is None:
+                                            first_audio_time = loop.time()
+                                            if user_speech_end_time:
+                                                latency = first_audio_time - user_speech_end_time
+                                                log_info(f"[LATENCY] Speech-to-response: {latency:.2f}s")
+
                                         pcm_24k = part.inline_data.data
-                                        pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
-                                        mulaw_8k = audioop.lin2ulaw(pcm_8k, 2)
+
+                                        # Offload downsampling to thread pool
+                                        pcm_8k = await loop.run_in_executor(
+                                            _audio_executor, _downsample_sync, pcm_24k
+                                        )
+                                        mulaw_8k = await loop.run_in_executor(
+                                            _audio_executor, _encode_mulaw_sync, pcm_8k
+                                        )
 
                                         payload = base64.b64encode(mulaw_8k).decode("utf-8")
                                         try:
@@ -302,24 +360,16 @@ async def media_stream(websocket: WebSocket):
                                             session_active = False
                                             break
 
-                            # AI speech transcription -> dashboard
                             if sc.output_transcription and sc.output_transcription.text:
                                 text = sc.output_transcription.text.strip()
                                 if text:
                                     log_info(f"[AI] {text}")
                                     await transcript_manager.add_message("ai", text)
 
-                            # User speech transcription -> dashboard
-                            if sc.input_transcription and sc.input_transcription.text:
-                                text = sc.input_transcription.text.strip()
-                                if text:
-                                    log_info(f"[USER] {text}")
-                                    await transcript_manager.add_message("user", text)
-
-                            # Turn complete - loop will restart receive()
                             if sc.turn_complete:
                                 log_info("[GEMINI] Turn complete")
-                                break  # break inner for, while True restarts
+                                first_audio_time = None
+                                break
 
                 except Exception as e:
                     log_info(f"[GEMINI->TWILIO] Error: {e}")
@@ -330,7 +380,6 @@ async def media_stream(websocket: WebSocket):
             log_info("[RELAY] Starting bidirectional relay...")
             await asyncio.gather(
                 twilio_to_gemini(),
-                audio_sender(),
                 gemini_to_twilio(),
                 return_exceptions=True,
             )
@@ -345,6 +394,15 @@ async def media_stream(websocket: WebSocket):
             await websocket.close()
         except:
             pass
+
+@app.on_event("startup")
+async def startup_event():
+    global NGROK_URL
+    NGROK_URL = get_ngrok_url()
+    if NGROK_URL:
+        log_info(f"[STARTUP] ngrok URL detected: {NGROK_URL}")
+    else:
+        log_info("[STARTUP] WARNING: ngrok not detected! Start ngrok before making calls.")
 
 if __name__ == "__main__":
     import uvicorn
