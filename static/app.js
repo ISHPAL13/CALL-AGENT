@@ -1,153 +1,127 @@
-let audioContext;
-let ws;
-let processor;
-let inputSource;
-let isListening = false;
-let audioQueue = [];
-let nextStartTime = 0;
-
-const micBtn = document.getElementById('mic-btn');
+const callBtn = document.getElementById('call-btn');
 const statusDot = document.getElementById('dot');
 const statusText = document.getElementById('status-text');
-const transcript = document.getElementById('transcript');
+const transcriptArea = document.getElementById('transcript-area');
+const transcriptStatus = document.getElementById('transcript-status');
 
-async function initUI() {
-    micBtn.addEventListener('click', toggleConnection);
+let callState = 'idle'; // idle | calling | connected
+let eventSource = null;
+
+// Connect to SSE for transcripts
+function connectSSE() {
+    if (eventSource) return;
+    
+    eventSource = new EventSource("/events");
+    transcriptStatus.textContent = "Listening to events...";
+    transcriptStatus.style.color = "var(--success)";
+    
+    eventSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        addTranscriptMessage(data.role, data.text);
+        
+        if (data.role === 'system') {
+            if (data.text.includes("Call connected")) {
+                callState = 'connected';
+                updateUI();
+            } else if (data.text.includes("Call ended")) {
+                callState = 'idle';
+                updateUI();
+            }
+        }
+    };
+    
+    eventSource.onerror = () => {
+        transcriptStatus.textContent = "Disconnected";
+        transcriptStatus.style.color = "var(--danger)";
+        eventSource.close();
+        eventSource = null;
+        
+        // Reconnect after 3 seconds
+        setTimeout(connectSSE, 3000);
+    };
 }
 
-async function toggleConnection() {
-    if (!isListening) {
-        startConnection();
+// Start SSE connection immediately
+connectSSE();
+
+function addTranscriptMessage(role, text) {
+    // If it's an AI message, check if we should append to the last one or create new
+    // We'll just create a new bubble for simplicity and clear presentation
+    
+    if (transcriptArea.children.length === 1 && transcriptArea.children[0].textContent.includes("Waiting for call")) {
+        transcriptArea.innerHTML = '';
+    }
+
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `message msg-${role}`;
+    
+    if (role === 'ai') {
+        msgDiv.textContent = `🤖 ${text}`;
     } else {
-        stopConnection();
+        msgDiv.textContent = text;
     }
+    
+    transcriptArea.appendChild(msgDiv);
+    transcriptArea.scrollTop = transcriptArea.scrollHeight;
 }
 
-async function startConnection() {
+callBtn.addEventListener('click', async () => {
+    if (callState === 'idle') {
+        await initiateCall();
+    } else if (callState === 'connected' || callState === 'calling') {
+        // Technically this button just updates UI since Twilio controls the call leg
+        // To actually hang up from the web, we'd need a backend endpoint to terminate the Twilio Call SID
+        callState = 'idle';
+        updateUI();
+        addTranscriptMessage('system', 'Call ended manually from dashboard');
+    }
+});
+
+async function initiateCall() {
+    callState = 'calling';
+    updateUI();
+    transcriptArea.innerHTML = ''; // Clear previous transcript
+    addTranscriptMessage('system', 'Initiating call...');
+
     try {
-        // Create context at native rate for better stability
-        audioContext = new (window.AudioContext || window.webkitAudioContext)();
-        const sampleRate = audioContext.sampleRate;
-        console.log(`DEBUG: Native sample rate: ${sampleRate}`);
-        
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        inputSource = audioContext.createMediaStreamSource(stream);
-        
-        // 4096 samples at 48kHz is ~85ms
-        processor = audioContext.createScriptProcessor(4096, 1, 1);
-        
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
-        ws.binaryType = 'arraybuffer';
+        const response = await fetch('/make-call', { method: 'POST' });
+        const data = await response.json();
 
-        ws.onopen = () => {
-            statusDot.classList.add('active');
-            statusText.innerText = 'Connected';
-            micBtn.classList.add('listening');
-            transcript.innerText = 'Listening...';
-            isListening = true;
-            
-            processor.onaudioprocess = (e) => {
-                if (!isListening || ws.readyState !== WebSocket.OPEN) return;
-                const inputData = e.inputBuffer.getChannelData(0);
-                
-                // Simple downsampling to 16kHz
-                const resampledData = resampleTo16k(inputData, sampleRate);
-                
-                // Convert Float32 to Int16 PCM
-                const pcmData = new Int16Array(resampledData.length);
-                for (let i = 0; i < resampledData.length; i++) {
-                    const s = Math.max(-1, Math.min(1, resampledData[i]));
-                    pcmData[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                }
-                ws.send(pcmData.buffer);
-            };
-
-            inputSource.connect(processor);
-            processor.connect(audioContext.destination);
-        };
-
-        ws.onmessage = async (e) => {
-            if (typeof e.data === 'string') {
-                const data = JSON.parse(e.data);
-                if (data.event === 'interrupted') {
-                    stopPlayback();
-                }
-                return;
-            }
-            console.log(`DEBUG: Received ${e.data.byteLength} bytes from server`);
-            if (audioContext.state === 'suspended') {
-                await audioContext.resume();
-            }
-            playAudioChunk(e.data);
-        };
-
-        ws.onclose = () => stopConnection();
-        ws.onerror = (err) => console.error('WS Error:', err);
-
+        if (data.status === 'calling') {
+            addTranscriptMessage('system', `Call placed (SID: ${data.call_sid.substring(0, 8)}...)`);
+            // The SSE events will handle switching state to 'connected' when Twilio hits the websocket
+        } else {
+            addTranscriptMessage('system', 'Failed to initiate call');
+            callState = 'idle';
+            updateUI();
+        }
     } catch (err) {
-        console.error('Failed to start microphone:', err);
-        alert('Could not access microphone.');
+        addTranscriptMessage('system', `Error: ${err.message}`);
+        callState = 'idle';
+        updateUI();
     }
 }
 
-// Basic linear resampling to 16kHz
-function resampleTo16k(inputData, originalSampleRate) {
-    if (originalSampleRate === 16000) return inputData;
-    
-    const ratio = originalSampleRate / 16000;
-    const newLength = Math.round(inputData.length / ratio);
-    const result = new Float32Array(newLength);
-    
-    for (let i = 0; i < newLength; i++) {
-        const index = Math.floor(i * ratio);
-        result[i] = inputData[index];
+function updateUI() {
+    statusDot.className = 'status-dot';
+    callBtn.className = '';
+
+    switch (callState) {
+        case 'idle':
+            statusText.textContent = 'Ready to call';
+            callBtn.innerHTML = '📞';
+            break;
+        case 'calling':
+            statusDot.classList.add('calling');
+            statusText.textContent = 'Calling your phone...';
+            callBtn.classList.add('calling');
+            callBtn.innerHTML = '📞';
+            break;
+        case 'connected':
+            statusDot.classList.add('connected');
+            statusText.textContent = 'AI Agent Active';
+            callBtn.classList.add('connected');
+            callBtn.innerHTML = '📴';
+            break;
     }
-    return result;
 }
-
-function playAudioChunk(arrayBuffer) {
-    if (!audioContext) return;
-    
-    const int16Array = new Int16Array(arrayBuffer);
-    const float32Array = new Float32Array(int16Array.length);
-    for (let i = 0; i < int16Array.length; i++) {
-        float32Array[i] = int16Array[i] / 32768;
-    }
-
-    const buffer = audioContext.createBuffer(1, float32Array.length, 24000);
-    buffer.getChannelData(0).set(float32Array);
-
-    const source = audioContext.createBufferSource();
-    source.buffer = buffer;
-    source.connect(audioContext.destination);
-
-    const startTime = Math.max(audioContext.currentTime, nextStartTime);
-    source.start(startTime);
-    nextStartTime = startTime + buffer.duration;
-    
-    audioQueue.push(source);
-}
-
-function stopPlayback() {
-    audioQueue.forEach(s => {
-        try { s.stop(); } catch(e) {}
-    });
-    audioQueue = [];
-    nextStartTime = 0;
-}
-
-function stopConnection() {
-    isListening = false;
-    if (ws) ws.close();
-    if (processor) processor.disconnect();
-    if (inputSource) inputSource.disconnect();
-    
-    statusDot.classList.remove('active');
-    statusText.innerText = 'Disconnected';
-    micBtn.classList.remove('listening');
-    transcript.innerText = 'Click to start conversation';
-    stopPlayback();
-}
-
-window.addEventListener('DOMContentLoaded', initUI);

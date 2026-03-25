@@ -4,3 +4,5 @@ websockets
 python-dotenv
 google-genai
 audioop-lts
+twilio
+sse-starlette

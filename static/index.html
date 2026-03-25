@@ -3,100 +3,323 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gemini Voice Agent</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600&display=swap" rel="stylesheet">
+    <title>AI Call Agent</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
+            --bg: #0a0e1a;
+            --card: #111827;
+            --card-border: rgba(56, 189, 248, 0.1);
             --primary: #38bdf8;
-            --secondary: #94a3b8;
-            --text: #f8fafc;
+            --primary-glow: rgba(56, 189, 248, 0.15);
+            --danger: #ef4444;
+            --danger-glow: rgba(239, 68, 68, 0.15);
+            --success: #22c55e;
+            --success-glow: rgba(34, 197, 94, 0.2);
+            --text: #f1f5f9;
+            --text-muted: #64748b;
+            --text-dim: #475569;
         }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
 
         body {
             font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
+            background: var(--bg);
             color: var(--text);
-            margin: 0;
+            min-height: 100vh;
             display: flex;
-            flex-direction: column;
             align-items: center;
             justify-content: center;
-            height: 100vh;
             overflow: hidden;
         }
 
-        .container {
-            background-color: var(--card-bg);
-            padding: 2.5rem;
-            border-radius: 1.5rem;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            text-align: center;
-            width: 90%;
-            max-width: 400px;
-            transition: transform 0.3s ease;
+        body::before {
+            content: '';
+            position: fixed;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(ellipse at 30% 20%, rgba(56, 189, 248, 0.05) 0%, transparent 50%),
+                        radial-gradient(ellipse at 70% 80%, rgba(168, 85, 247, 0.04) 0%, transparent 50%);
+            animation: bgShift 20s ease-in-out infinite alternate;
+            z-index: -1;
         }
 
-        h1 { margin-bottom: 0.5rem; font-size: 1.5rem; }
-        p { color: var(--secondary); margin-bottom: 2rem; font-size: 0.9rem; }
+        @keyframes bgShift {
+            0% { transform: translate(0, 0) rotate(0deg); }
+            100% { transform: translate(-5%, 5%) rotate(3deg); }
+        }
+
+        .container {
+            background: var(--card);
+            border: 1px solid var(--card-border);
+            border-radius: 24px;
+            padding: 2.5rem 2rem;
+            width: 95%;
+            max-width: 480px;
+            text-align: center;
+            box-shadow: 0 25px 60px rgba(0, 0, 0, 0.5),
+                        0 0 80px var(--primary-glow);
+            position: relative;
+            z-index: 10;
+        }
+
+        .container::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--primary), transparent);
+            opacity: 0.5;
+        }
+
+        .logo {
+            width: 48px;
+            height: 48px;
+            margin: 0 auto 1.2rem;
+            background: linear-gradient(135deg, var(--primary), #a855f7);
+            border-radius: 14px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.4rem;
+            box-shadow: 0 8px 24px rgba(56, 189, 248, 0.2);
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 0.3rem;
+            background: linear-gradient(135deg, var(--text), var(--primary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            margin-bottom: 1.5rem;
+            font-weight: 400;
+        }
+
+        .languages {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            margin-bottom: 1.5rem;
+        }
+
+        .lang-badge {
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 100px;
+            padding: 4px 10px;
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        /* Status bar */
+        .status-bar {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            margin-bottom: 2rem;
+            padding: 8px 16px;
+            border-radius: 100px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 0.8rem;
+            width: fit-content;
+            margin-inline: auto;
+        }
 
         .status-dot {
-            width: 12px;
-            height: 12px;
+            width: 8px;
+            height: 8px;
             border-radius: 50%;
-            display: inline-block;
-            margin-right: 8px;
-            background-color: #ef4444; /* red */
+            background: var(--text-dim);
+            transition: all 0.3s ease;
         }
-        .status-dot.active { background-color: #22c55e; /* green */ }
 
-        #mic-btn {
-            background-color: var(--primary);
-            color: white;
-            border: none;
+        .status-dot.calling {
+            background: #f59e0b;
+            box-shadow: 0 0 8px rgba(245, 158, 11, 0.5);
+            animation: blink 1s infinite;
+        }
+
+        .status-dot.connected {
+            background: var(--success);
+            box-shadow: 0 0 8px var(--success-glow);
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        #status-text {
+            color: var(--text-muted);
+            font-weight: 500;
+        }
+
+        /* Call button */
+        #call-btn {
             width: 80px;
             height: 80px;
             border-radius: 50%;
+            border: none;
             cursor: pointer;
             display: flex;
             align-items: center;
             justify-content: center;
-            margin: 0 auto;
+            margin: 0 auto 1.5rem;
             font-size: 2rem;
-            box-shadow: 0 0 20px rgba(56, 189, 248, 0.4);
-            transition: transform 0.2s, box-shadow 0.2s;
+            transition: all 0.3s ease;
+            position: relative;
+            background: linear-gradient(135deg, var(--primary), #0ea5e9);
+            box-shadow: 0 8px 30px rgba(56, 189, 248, 0.3);
         }
 
-        #mic-btn:active { transform: scale(0.9); }
-        #mic-btn.listening {
-            animation: pulse 1.5s infinite;
-            background-color: #f43f5e;
-            box-shadow: 0 0 30px rgba(244, 63, 94, 0.6);
+        #call-btn:hover {
+            transform: scale(1.05);
+            box-shadow: 0 12px 40px rgba(56, 189, 248, 0.45);
         }
 
-        @keyframes pulse {
-            0% { transform: scale(1); box-shadow: 0 0 20px rgba(244, 63, 94, 0.4); }
-            50% { transform: scale(1.1); box-shadow: 0 0 40px rgba(244, 63, 94, 0.6); }
-            100% { transform: scale(1); box-shadow: 0 0 20px rgba(244, 63, 94, 0.4); }
+        #call-btn:active {
+            transform: scale(0.95);
         }
 
-        #transcript {
-            margin-top: 2rem;
-            font-style: italic;
-            height: 3rem;
-            opacity: 0.7;
+        #call-btn.calling {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            box-shadow: 0 8px 30px rgba(245, 158, 11, 0.3);
+            animation: callPulse 2s infinite;
         }
+
+        #call-btn.connected {
+            background: linear-gradient(135deg, var(--danger), #dc2626);
+            box-shadow: 0 8px 30px var(--danger-glow);
+            animation: none;
+        }
+
+        @keyframes callPulse {
+            0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4); }
+            70% { box-shadow: 0 0 0 20px rgba(245, 158, 11, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+        }
+
+        /* Transcript area */
+        .transcript-container {
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            border-radius: 16px;
+            height: 200px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            margin-top: 1.5rem;
+        }
+        
+        .transcript-header {
+            background: rgba(255,255,255,0.02);
+            padding: 8px 16px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            font-size: 0.75rem;
+            color: var(--text-dim);
+            text-align: left;
+            font-weight: 500;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .transcript-area {
+            flex: 1;
+            padding: 1rem;
+            overflow-y: auto;
+            text-align: left;
+            scroll-behavior: smooth;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .message {
+            max-width: 85%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 0.9rem;
+            line-height: 1.4;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(5px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .msg-ai {
+            background: rgba(56, 189, 248, 0.1);
+            border: 1px solid rgba(56, 189, 248, 0.2);
+            color: #bae6fd;
+            border-bottom-left-radius: 2px;
+            align-self: flex-start;
+        }
+
+        .msg-system {
+            background: transparent;
+            color: var(--text-dim);
+            font-size: 0.75rem;
+            align-self: center;
+            padding: 4px;
+            font-family: monospace;
+        }
+        
+        .msg-system::before {
+            content: '— ';
+        }
+        .msg-system::after {
+            content: ' —';
+        }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Gemini Voice AI</h1>
-        <p><span id="dot" class="status-dot"></span> <span id="status-text">Disconnected</span></p>
+        <div class="logo">📞</div>
+        <h1>AI Call Agent</h1>
+        <p class="subtitle">Gemini powered · Twilio Voice</p>
         
-        <button id="mic-btn">🎙️</button>
-        
-        <div id="transcript">Click to start conversation</div>
+        <div class="languages">
+            <span class="lang-badge">🇺🇸 English</span>
+            <span class="lang-badge">🇮🇳 Hindi</span>
+            <span class="lang-badge">🇮🇳 Marathi</span>
+        </div>
+
+        <div class="status-bar">
+            <span id="dot" class="status-dot"></span>
+            <span id="status-text">Ready to call</span>
+        </div>
+
+        <button id="call-btn">📞</button>
+
+        <div class="transcript-container">
+            <div class="transcript-header">
+                <span>Live Transcript</span>
+                <span id="transcript-status">Disconnected</span>
+            </div>
+            <div id="transcript-area" class="transcript-area">
+                <div class="message msg-system">Waiting for call...</div>
+            </div>
+        </div>
     </div>
 
     <script src="/static/app.js"></script>

@@ -9,3 +9,5 @@ ngrok.exe
 .idea/
 .vscode/
 node_modules/
+debug.log
+server.log
