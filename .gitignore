@@ -11,3 +11,5 @@ ngrok.exe
 node_modules/
 debug.log
 server.log
+
+gitingest.txt
