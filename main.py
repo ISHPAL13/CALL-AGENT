@@ -50,7 +50,7 @@ TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 YOUR_PHONE_NUMBER = os.getenv("YOUR_PHONE_NUMBER")
 
 # Thread pool for CPU-bound audio ops (keeps async loop unblocked)
-_audio_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="audio")
+_audio_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="audio")
 
 def _resample_sync(pcm_8k: bytes, ratecv_state):
     """Run in thread pool — keeps event loop free."""
@@ -212,9 +212,9 @@ async def media_stream(websocket: WebSocket):
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=50,
-                silence_duration_ms=200,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
+                prefix_padding_ms=20,
+                silence_duration_ms=80,
             )
         ),
         system_instruction=types.Content(
@@ -253,10 +253,7 @@ async def media_stream(websocket: WebSocket):
                 chunks = 0
                 sends = 0
                 ratecv_state = None
-
-                # *** KEY CHANGE: send every packet immediately (no batching) ***
-                # One Twilio packet = 20ms of audio — Gemini handles it fine.
-                # Batching was adding up to 100ms of unnecessary delay per chunk.
+                
                 try:
                     async for message in websocket.iter_text():
                         if not session_active:
@@ -277,21 +274,15 @@ async def media_stream(websocket: WebSocket):
                                 _audio_executor, _decode_mulaw_sync, mulaw_bytes
                             )
 
-                            # RMS-based silence gate (Noise Gate)
-                            rms = audioop.rms(pcm_8k, 2)
-                            # log_info(f"[RMS] {rms}")  # Temporarily uncomment to tune the 200 threshold
-                            if rms < 200:
-                                pcm_8k = bytes(len(pcm_8k))
-
                             pcm_16k, ratecv_state = await loop.run_in_executor(
                                 _audio_executor, _resample_sync, pcm_8k, ratecv_state
                             )
 
-                            # Send immediately — no batching delay
+                            chunks += 1
+
                             await session.send_realtime_input(
                                 audio=types.Blob(data=pcm_16k, mime_type="audio/pcm;rate=16000")
                             )
-                            chunks += 1
                             sends += 1
 
                         elif event == "stop":
