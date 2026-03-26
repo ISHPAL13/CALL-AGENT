@@ -51,6 +51,9 @@ YOUR_PHONE_NUMBER = os.getenv("YOUR_PHONE_NUMBER")
 
 # Thread pool for CPU-bound audio ops (keeps async loop unblocked)
 _audio_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="audio")
+CALLER_SPEECH_RMS_THRESHOLD = 250
+CALLER_SPEECH_FRAMES_TO_START = 3
+CALLER_SILENCE_FRAMES_TO_END = 10
 
 def _resample_sync(pcm_8k: bytes, ratecv_state):
     """Run in thread pool — keeps event loop free."""
@@ -66,6 +69,9 @@ def _encode_mulaw_sync(pcm_8k: bytes) -> bytes:
 def _downsample_sync(pcm_24k: bytes):
     pcm_8k, _ = audioop.ratecv(pcm_24k, 2, 1, 24000, 8000, None)
     return pcm_8k
+
+def _rms_sync(pcm_8k: bytes) -> int:
+    return audioop.rms(pcm_8k, 2)
 
 def get_ngrok_url():
     try:
@@ -201,6 +207,12 @@ async def media_stream(websocket: WebSocket):
     stream_sid = None
     session_active = True
     loop = asyncio.get_event_loop()
+    ai_playing = False
+    drop_current_model_audio = False
+    caller_speech_frames = 0
+    caller_silence_frames = 0
+    latest_user_audio_time = None
+    user_activity_active = False
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     model = "gemini-2.5-flash-native-audio-preview-12-2025"
@@ -211,11 +223,10 @@ async def media_stream(websocket: WebSocket):
         input_audio_transcription=types.AudioTranscriptionConfig(),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
-                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_LOW,
-                prefix_padding_ms=20,
-                silence_duration_ms=80,
-            )
+                disabled=True,
+            ),
+            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
         ),
         system_instruction=types.Content(
             parts=[
@@ -237,6 +248,18 @@ async def media_stream(websocket: WebSocket):
         async with client.aio.live.connect(model=model, config=config) as session:
             log_info("[GEMINI] Session ESTABLISHED")
 
+            async def clear_twilio_audio(reason: str):
+                if not stream_sid or not session_active:
+                    return
+                try:
+                    await websocket.send_json({
+                        "event": "clear",
+                        "streamSid": stream_sid,
+                    })
+                    log_info(f"[TWILIO] Cleared buffered audio ({reason})")
+                except Exception as e:
+                    log_info(f"[TWILIO] Clear failed ({reason}): {e}")
+
             try:
                 await session.send_realtime_input(
                     text="The call just connected. Please greet the caller."
@@ -249,7 +272,10 @@ async def media_stream(websocket: WebSocket):
             # Twilio -> Gemini: stream audio with minimal buffering
             # ----------------------------------------------------------------
             async def twilio_to_gemini():
-                nonlocal stream_sid, session_active
+                nonlocal stream_sid, session_active, ai_playing
+                nonlocal drop_current_model_audio, caller_speech_frames
+                nonlocal caller_silence_frames, latest_user_audio_time
+                nonlocal user_activity_active
                 chunks = 0
                 sends = 0
                 ratecv_state = None
@@ -273,6 +299,39 @@ async def media_stream(websocket: WebSocket):
                             pcm_8k = await loop.run_in_executor(
                                 _audio_executor, _decode_mulaw_sync, mulaw_bytes
                             )
+                            rms = await loop.run_in_executor(
+                                _audio_executor, _rms_sync, pcm_8k
+                            )
+
+                            if rms >= CALLER_SPEECH_RMS_THRESHOLD:
+                                latest_user_audio_time = loop.time()
+                                caller_speech_frames += 1
+                                caller_silence_frames = 0
+                            else:
+                                caller_speech_frames = 0
+                                caller_silence_frames += 1
+
+                            if (
+                                not user_activity_active
+                                and caller_speech_frames >= CALLER_SPEECH_FRAMES_TO_START
+                            ):
+                                user_activity_active = True
+                                await session.send_realtime_input(
+                                    activity_start=types.ActivityStart()
+                                )
+                                log_info(f"[VAD] Activity start (rms={rms})")
+
+                            if (
+                                ai_playing
+                                and not drop_current_model_audio
+                                and user_activity_active
+                            ):
+                                drop_current_model_audio = True
+                                ai_playing = False
+                                await clear_twilio_audio("caller barge-in")
+                                log_info(
+                                    f"[INTERRUPT] Caller speech detected while AI was talking (rms={rms})"
+                                )
 
                             pcm_16k, ratecv_state = await loop.run_in_executor(
                                 _audio_executor, _resample_sync, pcm_8k, ratecv_state
@@ -284,6 +343,16 @@ async def media_stream(websocket: WebSocket):
                                 audio=types.Blob(data=pcm_16k, mime_type="audio/pcm;rate=16000")
                             )
                             sends += 1
+
+                            if (
+                                user_activity_active
+                                and caller_silence_frames >= CALLER_SILENCE_FRAMES_TO_END
+                            ):
+                                user_activity_active = False
+                                await session.send_realtime_input(
+                                    activity_end=types.ActivityEnd()
+                                )
+                                log_info("[VAD] Activity end")
 
                         elif event == "stop":
                             log_info("[STREAM] Twilio stop event")
@@ -299,10 +368,11 @@ async def media_stream(websocket: WebSocket):
             # Gemini -> Twilio: forward audio as fast as it arrives
             # ----------------------------------------------------------------
             async def gemini_to_twilio():
-                nonlocal session_active
+                nonlocal session_active, ai_playing, drop_current_model_audio
+                nonlocal caller_speech_frames, caller_silence_frames
+                nonlocal latest_user_audio_time, user_activity_active
                 audio_out = 0
                 first_audio_time = None
-                user_speech_end_time = None
                 try:
                     while session_active:
                         async for response in session.receive():
@@ -318,15 +388,24 @@ async def media_stream(websocket: WebSocket):
                                 if text:
                                     log_info(f"[USER] {text}")
                                     await transcript_manager.add_message("user", text)
-                                    user_speech_end_time = loop.time()
+
+                            if sc.interrupted:
+                                ai_playing = False
+                                drop_current_model_audio = True
+                                await clear_twilio_audio("Gemini interruption")
+                                log_info("[GEMINI] Current response interrupted")
 
                             if sc.model_turn:
                                 for part in sc.model_turn.parts:
                                     if part.inline_data and part.inline_data.data and stream_sid:
+                                        if drop_current_model_audio:
+                                            continue
+
                                         if first_audio_time is None:
                                             first_audio_time = loop.time()
-                                            if user_speech_end_time:
-                                                latency = first_audio_time - user_speech_end_time
+                                            ai_playing = True
+                                            if latest_user_audio_time:
+                                                latency = first_audio_time - latest_user_audio_time
                                                 log_info(f"[LATENCY] Speech-to-response: {latency:.2f}s")
 
                                         pcm_24k = part.inline_data.data
@@ -346,6 +425,7 @@ async def media_stream(websocket: WebSocket):
                                                 "streamSid": stream_sid,
                                                 "media": {"payload": payload},
                                             })
+                                            ai_playing = True
                                             audio_out += 1
                                         except Exception:
                                             session_active = False
@@ -359,6 +439,11 @@ async def media_stream(websocket: WebSocket):
 
                             if sc.turn_complete:
                                 log_info("[GEMINI] Turn complete")
+                                ai_playing = False
+                                drop_current_model_audio = False
+                                caller_speech_frames = 0
+                                caller_silence_frames = 0
+                                user_activity_active = False
                                 first_audio_time = None
                                 break
 
